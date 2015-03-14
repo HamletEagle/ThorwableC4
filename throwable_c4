@@ -1,0 +1,258 @@
+/*
+	Copyleft 2014 @ HamletEagle
+	Plugin Theard: https://forums.alliedmods.net/showthread.php?p=2203556
+
+	Throwable C4 is free software;
+	you can redistribute it and/or modify it under the terms of the
+	GNU General Public License as published by the Free Software Foundation.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the	
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with Furiens; if not, write to the
+	Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+	Boston, MA 02111-1307, USA.
+
+	Changelog: 
+	
+	V 0.1:  
+	+ Initial Release.  
+	V 0.2:  
+	+ Fixed some think bugs.
+	+ Now using a more efficient method to get detect when player is using IN_ATTACK2 button
+	+ Fixed a bug when you can't plant the c4 as per usual.
+	+ Now the bomb hud icon is put back when you pickup the fake c4.
+	+ Now the boxs near the bombsite are destroyed.
+	V 0.3:
+	+ Now the bomb is handled by the game so api removed.
+	V 0.4:
+	+ Changed a lot of stuffs, can't write all of them here.
+	V 0.5:
+	+ Major changes, Arkshine pocket is empty now, hopefuly.
+	V 0.6:
+	+ Fixed plugin not working on linux
+	+ Changed variable names
+*/ 
+
+#include <amxmodx>
+#include <engine>
+#include <fakemeta>
+#include <hamsandwich>
+#include <cstrike>
+#include <okapi>
+#include <xs>
+#if AMXX_VERSION_NUM  >= 183
+#include <csx>
+#endif
+
+#define PLUGIN  "Throwable C4"
+#define VERSION "0.6"
+#define AUTHOR  "HamletEagle"
+
+new HamHook: HookCBaseEntity_C4Idle
+new HamHook: HookCBasePlayer_ItemHolster
+new HamHook: HookCBasePlayer_ItemDeploy
+
+const XO_WEAPON = 16
+const MAPZONE_BIT_BOMB = 1 << 1
+const m_bStartedArming = 320	
+const m_bBombPlacedAnimation= 321
+const m_fMapZone = 234
+
+new g_iC4Id
+new gmsgBombDrop
+
+#if AMXX_VERSION_NUM < 183
+const INT_BYTES = 4 
+const BYTE_BITS = 8 
+
+stock set_pdata_bool(ent, charbased_offset, _:value, intbase_linuxdiff = 5)
+{
+	value &= 0xFF 
+	new int_offset_value = get_pdata_int(ent, charbased_offset / INT_BYTES, intbase_linuxdiff) 
+	new bit_decal = (charbased_offset % INT_BYTES) * BYTE_BITS 
+	int_offset_value &= ~(0xFF<<bit_decal) // clear byte 
+	int_offset_value |= value<<bit_decal 
+	set_pdata_int(ent, charbased_offset / INT_BYTES, int_offset_value, intbase_linuxdiff) 
+}
+#endif 
+
+public plugin_init()
+{
+	register_plugin
+	( 
+		.plugin_name = PLUGIN,
+		.version = VERSION, 
+		.author = AUTHOR 
+	)
+	
+	//FM_CmdStart is not a good way, so here is the alternative 
+	HookCBasePlayer_ItemDeploy  = RegisterHam(Ham_Item_Deploy, "weapon_c4", "CBasePlayer_ItemDeploy", false)
+	HookCBasePlayer_ItemHolster = RegisterHam(Ham_Item_Holster, "weapon_c4", "CBasePlayer_ItemHolster", false) 
+	HookCBaseEntity_C4Idle      = RegisterHam(Ham_Weapon_WeaponIdle, "weapon_c4", "CBaseEntity_C4Idle", true)
+	DisableHamForward(HookCBaseEntity_C4Idle) //disable it for now
+	
+	#if AMXX_VERSION_NUM < 183
+	if(!find_ent_by_class(-1 , "func_bomb_target") && !find_ent_by_class(-1 , "info_bomb_target"))
+	{
+		set_fail_state("Not a bomb map, plugin paused")
+	}
+	#else
+	if(!(get_map_objectives( ) & MapObjective_Bomb))
+	{
+		set_fail_state("Not a bomb map, plugin paused")
+	}
+	#endif
+	
+	//Hook CGrenade::ShootSatchelCharge
+	new const ShootSatchelChargeSignature  [ ] = { 0x83, 0xDEF, 0xDEF, 0x53, 0x56, 0x57, 0xFF, 0xDEF, 0xDEF, 0xDEF, 0xDEF, 0xDEF, 0x33 }
+	new const ShootSatchelChargeSymbol     [ ] = "_ZN8CGrenade18ShootSatchelChargeEP9entvars_s6VectorS2_"
+	
+	new funcShootSatchelChage
+	
+	if
+	( 
+		(funcShootSatchelChage = okapi_mod_get_symbol_ptr(ShootSatchelChargeSymbol)) || 
+		(funcShootSatchelChage = okapi_mod_find_sig(ShootSatchelChargeSignature, sizeof ShootSatchelChargeSignature)) 
+	) 
+	{ 
+		okapi_add_hook(okapi_build_function(funcShootSatchelChage, arg_cbase, arg_entvars, arg_vec, arg_vec), "OnShootSatchelCharge", .post = 1) 
+	} 
+
+	else
+	{
+		set_fail_state("CGrenade::ShootSatchelCharge function could not be found.")
+	}
+	gmsgBombDrop = get_user_msgid("BombDrop")
+}
+
+
+public CBasePlayer_ItemDeploy(iEnt)
+{
+	EnableHamForward(HookCBaseEntity_C4Idle)
+}
+
+public CBasePlayer_ItemHolster(iEnt)
+{
+	DisableHamForward(HookCBaseEntity_C4Idle)
+}
+
+public CBaseEntity_C4Idle(iEnt)
+{
+	new id = pev(iEnt, pev_owner)
+	if((pev(id, pev_button) & IN_ATTACK2) && pev_valid(iEnt)) //did player pressed IN_ATTACK2 button ?
+	{
+		if(get_pdata_int(id, m_fMapZone) & MAPZONE_BIT_BOMB) //in bomb zone ?
+		{
+			// Below here is some boring math: https://github.com/Arkshine/CSSDK/blob/ ... renade.cpp
+			// Basically, I'm applying somekegrenade throw on a c4 so I won't explain, it's obvious
+			// Calculate how hard to throw the grenade based on the aim angle
+			new Float: playerVelocity [ 3 ]; pev(id, pev_velocity, playerVelocity)
+			new Float: playerOrigin   [ 3 ]; pev(id, pev_origin, playerOrigin)
+			new Float: vViewAngle	  [ 3 ]; pev(id, pev_v_angle, vViewAngle)
+			new Float: vPunchAngle    [ 3 ]; pev(id, pev_punchangle, vPunchAngle)
+			new Float: playerViewOfs  [ 3 ]; pev(id, pev_view_ofs,  playerViewOfs)
+			new Float: vAngleThrow    [ 3 ]; new Float: fDirection[ 3 ]
+			
+			//By adding them, we get an origin at the "points" of the gun
+			xs_vec_add(playerVelocity, playerViewOfs, fDirection)
+			xs_vec_add(vViewAngle, vPunchAngle, vAngleThrow)
+			
+			if(vAngleThrow[ 0 ] < 0) 
+			{
+				vAngleThrow[ 0 ] = -10 + vAngleThrow[ 0 ] * ((90 - 10) / 90.0)
+			} 
+			else
+			{
+				vAngleThrow[ 0 ] = -10 + vAngleThrow[ 0 ] * ((90 + 10) / 90.0)
+			}
+			
+			//Let the game do the job for us
+			engfunc(EngFunc_MakeVectors, vAngleThrow)
+			global_get(glb_v_forward, fDirection)
+			
+			playerOrigin[ 0 ] = playerOrigin[ 0 ] + (16.0 * fDirection[ 0 ])
+			playerOrigin[ 1 ] = playerOrigin[ 1 ] + (16.0 * fDirection[ 1 ])
+			playerOrigin[ 2 ] = playerOrigin[ 2 ] + (16.0 * fDirection[ 2 ])
+		
+			new Float: fMulty = floatmin((90 - vAngleThrow[ 0 ]) * 6.0, 750.0)
+			playerVelocity[ 0 ] = playerVelocity[ 0 ] + (fMulty * fDirection[ 0 ])
+			playerVelocity[ 1 ] = playerVelocity[ 1 ] + (fMulty * fDirection[ 1 ])
+			playerVelocity[ 2 ] = playerVelocity[ 2 ] + (fMulty * fDirection[ 2 ])
+			
+			//We already have the entid, otherwise we would need
+			//to retrive it from 372 offset( m_rgpPlayerItems )
+			//By setting m_bStartedArming and m_bBombPlacedAnimation we fake the c4 plant
+			//We set the mapzone so the game will think you are in a bombsite.
+			//We set user flags on ground, just to make sure
+			
+			set_pdata_bool(iEnt, m_bStartedArming, true, XO_WEAPON)
+			set_pdata_bool(iEnt, m_bBombPlacedAnimation, true, XO_WEAPON)
+			set_pev(id, pev_flags, pev(id, pev_flags) | FL_ONGROUND)
+			
+			new msgBlockType = get_msg_block(gmsgBombDrop)
+			set_msg_block(gmsgBombDrop, BLOCK_ONCE)
+			
+			//Now, execute primary attack on the weapon_c4 entity, this will create the grenade_entity
+			ExecuteHamB(Ham_Weapon_PrimaryAttack, iEnt)
+			
+			if(!pev_valid(g_iC4Id))
+			{
+				return
+			}
+			
+			//Set the origin in the "middle" zone of the player
+			//So the c4 throw will be like a grenade one
+			set_pev(g_iC4Id, pev_origin, playerOrigin)
+			set_pev(g_iC4Id, pev_velocity, playerVelocity)
+			
+			new iTrace = create_tr2()
+			engfunc(EngFunc_TraceToss, g_iC4Id, IGNORE_MONSTERS, iTrace)
+			new Float: fEndOrigin[ 3 ]; get_tr2(iTrace, TR_vecEndPos, fEndOrigin)
+			
+			emessage_begin(MSG_ALL, gmsgBombDrop)
+			{
+				engfunc(EngFunc_WriteCoord, fEndOrigin[ 0 ])
+				engfunc(EngFunc_WriteCoord, fEndOrigin[ 1 ])
+				engfunc(EngFunc_WriteCoord, fEndOrigin[ 2 ])
+				ewrite_byte(1)
+				emessage_end()
+			}
+			
+			free_tr2(iTrace)
+			set_msg_block(gmsgBombDrop, msgBlockType)
+		}  
+		else
+		{
+			#if AMXX_VERSION_NUM < 183
+			engclient_cmd( id, "drop", "weapon_c4" )	
+			#else
+			amxclient_cmd( id, "drop", "weapon_c4" )
+			#endif
+		}
+		
+	}
+}
+
+public OnShootSatchelCharge(iOwner, iEnt, Float: fOrigin[ ], Float: fAngles[ ])
+{
+	//Get c4 ent id
+	g_iC4Id = okapi_get_orig_return( )
+}
+
+public plugin_pause()
+{
+	DisableHamForward(HookCBaseEntity_C4Idle)
+	DisableHamForward(HookCBasePlayer_ItemDeploy)
+	DisableHamForward(HookCBasePlayer_ItemHolster)
+}
+
+public plugin_unpause()
+{
+	EnableHamForward(HookCBaseEntity_C4Idle)
+	EnableHamForward(HookCBasePlayer_ItemDeploy)
+	EnableHamForward(HookCBasePlayer_ItemHolster)
+}
